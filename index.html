@@ -1,0 +1,726 @@
+───────────────────────────────────────────────────────────────
+STEP 3  โค้ดทั้งระบบ (ไฟล์เดียวจบ) — ก๊อปปี้ทั้งหมดนี้ไปวาง
+───────────────────────────────────────────────────────────────
+
+<!doctype html>
+<html lang="th">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#0f172a" />
+<title>ระบบจัดการร้านสนุ๊กเกอร์</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+<link href="https://fonts.googleapis.com/css2?family=Sarabun:wght@400;600;700&display=swap" rel="stylesheet" />
+<style>
+  body { font-family: Sarabun, system-ui, sans-serif; background:#0f172a; }
+  input, select, textarea { font-size:16px; }
+  .tabular { font-variant-numeric: tabular-nums; }
+</style>
+</head>
+<body>
+<div id="root" class="text-white"></div>
+
+<script type="text/babel" data-type="module">
+import React, { useState, useEffect, useMemo } from "https://esm.sh/react@18.2.0";
+import { createRoot } from "https://esm.sh/react-dom@18.2.0/client";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getAuth, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  signOut, onAuthStateChanged
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore, collection, doc, addDoc, setDoc, getDoc, getDocs, updateDoc,
+  onSnapshot, query, where, orderBy, limit, serverTimestamp, increment,
+  writeBatch, runTransaction, deleteDoc
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+
+/* ===================================================================
+   [[[ แก้ตรงนี้ที่เดียว ]]] วางค่าจาก STEP 1.6 ทับของเดิมให้ครบทุกบรรทัด
+   =================================================================== */
+const firebaseConfig = {
+  apiKey: "ใส่ค่าของคุณ",
+  authDomain: "ใส่ค่าของคุณ",
+  projectId: "ใส่ค่าของคุณ",
+  storageBucket: "ใส่ค่าของคุณ",
+  messagingSenderId: "ใส่ค่าของคุณ",
+  appId: "ใส่ค่าของคุณ"
+};
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+
+/* ================= ค่าคงที่ของร้าน ================= */
+const ZONES = {
+  vip:    { label:"โซน VIP",   hourRate:120, gameRate:40, color:"bg-yellow-400" },
+  normal: { label:"โซนธรรมดา", hourRate:60,  gameRate:15, color:"bg-sky-400" }
+};
+const SEED_TABLES = [
+  { number:1, name:"VIP 1",  zone:"vip" },
+  { number:2, name:"VIP 2",  zone:"vip" },
+  { number:3, name:"VIP 3",  zone:"vip" },
+  { number:4, name:"โต๊ะ 4", zone:"normal" },
+  { number:5, name:"โต๊ะ 5", zone:"normal" },
+  { number:6, name:"โต๊ะ 6", zone:"normal" }
+];
+const SEED_PRODUCTS = [
+  { id:"soda",     name:"น้ำอัดลม",   price:15, order:1 },
+  { id:"leo",      name:"เบียร์ LEO", price:70, order:2 },
+  { id:"water",    name:"น้ำเปล่า",   price:10, order:3 },
+  { id:"m150",     name:"M-150",      price:15, order:4 },
+  { id:"redbull",  name:"กระทิงแดง",  price:15, order:5 },
+  { id:"bigtowel", name:"ผ้าผืนใหญ่", price:30, order:6 }
+];
+
+/* ================= ฟังก์ชันช่วยเหลือ ================= */
+const baht = n => (Number(n)||0).toLocaleString("th-TH") + " ฿";
+const pad  = n => String(n).padStart(2,"0");
+const hhmmss = s => { s=Math.max(0,Math.floor(s));
+  return pad(Math.floor(s/3600))+":"+pad(Math.floor(s%3600/60))+":"+pad(s%60); };
+const clock = ms => ms ? new Date(ms).toLocaleTimeString("th-TH",{hour:"2-digit",minute:"2-digit"}) : "-";
+const dayKey = (d=new Date()) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`;
+const ms = t => t?.toMillis ? t.toMillis() : null;
+const diffMin = (a,b) => (!a||!b||b<=a) ? 0 : Math.ceil((b-a)/60000);
+// ค่าโต๊ะ: รายชั่วโมง = (นาที/60) x เรท | รายเกม = เกม x เรท
+const calcTable = ({zone,mode,minutes=0,games=0}) => {
+  const c = ZONES[zone]; if(!c) return 0;
+  return mode==="game" ? games*c.gameRate : Math.round(minutes/60*c.hourRate);
+};
+const keysOf = (d=new Date()) => ({ dayKey:dayKey(d), monthKey:dayKey(d).slice(0,7), yearKey:String(d.getFullYear()) });
+
+/* ชื่อเครื่อง เก็บไว้ในมือถือเครื่องนั้น ใช้ตรวจสอบย้อนหลัง */
+const getDevice = () => {
+  let n = localStorage.getItem("dev_name");
+  if(!n){ n = prompt("ตั้งชื่อเครื่องนี้ (เช่น มือถือเจ้าของ, เครื่องเคาน์เตอร์)") || "ไม่ระบุ"; localStorage.setItem("dev_name", n); }
+  return n;
+};
+
+/* ================= service: คุยกับฐานข้อมูล ================= */
+const writeLog = (o) => addDoc(collection(db,"logs"), {
+  action:o.action, message:o.message, billId:o.billId||null, tableId:o.tableId||null,
+  actorUid:o.actor.uid, actorName:o.actor.name, deviceName:o.actor.device,
+  before:o.before||null, after:o.after||null, createdAt:serverTimestamp()
+});
+
+async function openTable({table, mode, customerName, actor}){
+  const billRef = doc(collection(db,"bills"));
+  await runTransaction(db, async tx => {
+    const t = await tx.get(doc(db,"tables",table.id));
+    if(t.data().status === "occupied") throw new Error("โต๊ะนี้เพิ่งถูกเปิดจากอีกเครื่อง");
+    tx.set(billRef, {
+      billNo:"B"+Date.now().toString().slice(-7), type:"table",
+      tableId:table.id, tableName:table.name, zone:table.zone, billingMode:mode,
+      customerName:customerName||"", customerKey:(customerName||"").trim().toLowerCase(),
+      status:"open", startAt:serverTimestamp(), endAt:null,
+      minutes:0, games:0, tableAmount:0, itemsAmount:0, discount:0, total:0,
+      paymentMethod:null, note:"", mergedFrom:[], moveHistory:[],
+      createdBy:actor, createdAt:serverTimestamp(), updatedAt:serverTimestamp(), ...keysOf()
+    });
+    tx.update(doc(db,"tables",table.id), { status:"occupied", currentBillId:billRef.id });
+  });
+  await writeLog({action:"OPEN_TABLE", message:`เปิดโต๊ะ ${table.name} โดย ${actor.name}`, billId:billRef.id, tableId:table.id, actor});
+  return billRef.id;
+}
+
+async function addItem({bill, product, qty, actor}){
+  const amount = product.price * qty;
+  await addDoc(collection(db,"bills",bill.id,"items"), {
+    productId:product.id, name:product.name, price:product.price, qty, amount,
+    addedBy:actor, createdAt:serverTimestamp()
+  });
+  await updateDoc(doc(db,"bills",bill.id), {
+    itemsAmount:increment(amount), total:increment(amount), updatedAt:serverTimestamp()
+  });
+  await writeLog({action:"ADD_ITEM", message:`เพิ่ม ${product.name} x${qty} (${bill.tableName}) โดย ${actor.name}`, billId:bill.id, actor});
+}
+
+async function removeItem({bill, item, actor}){
+  await deleteDoc(doc(db,"bills",bill.id,"items",item.id));
+  await updateDoc(doc(db,"bills",bill.id), {
+    itemsAmount:increment(-item.amount), total:increment(-item.amount), updatedAt:serverTimestamp()
+  });
+  await writeLog({action:"EDIT_BILL", message:`ลบ ${item.name} x${item.qty} ออกจากบิล โดย ${actor.name}`, billId:bill.id, actor, before:item});
+}
+
+async function setGames({bill, games, actor}){
+  const g = Math.max(0, games);
+  const tableAmount = calcTable({zone:bill.zone, mode:"game", games:g});
+  await updateDoc(doc(db,"bills",bill.id), {
+    games:g, tableAmount, total:tableAmount+(bill.itemsAmount||0)-(bill.discount||0), updatedAt:serverTimestamp()
+  });
+  await writeLog({action:"EDIT_BILL", message:`ปรับเกม ${bill.tableName} เป็น ${g} เกม โดย ${actor.name}`, billId:bill.id, actor, before:{games:bill.games}, after:{games:g}});
+}
+
+async function moveTable({bill, toTable, actor}){
+  const now = Date.now();
+  const segMin = bill.billingMode==="hour" ? diffMin(ms(bill.startAt), now) : 0;
+  const segAmt = calcTable({zone:bill.zone, mode:bill.billingMode, minutes:segMin});
+  const tableAmount = (bill.tableAmount||0) + segAmt;
+  const b = writeBatch(db);
+  b.update(doc(db,"tables",bill.tableId), { status:"free", currentBillId:null });
+  b.update(doc(db,"tables",toTable.id),  { status:"occupied", currentBillId:bill.id });
+  b.update(doc(db,"bills",bill.id), {
+    tableId:toTable.id, tableName:toTable.name, zone:toTable.zone,
+    startAt:serverTimestamp(), minutes:(bill.minutes||0)+segMin, tableAmount,
+    total:tableAmount+(bill.itemsAmount||0)-(bill.discount||0),
+    moveHistory:[...(bill.moveHistory||[]), {from:bill.tableName,to:toTable.name,minutes:segMin,amount:segAmt,at:new Date().toISOString()}],
+    updatedAt:serverTimestamp()
+  });
+  await b.commit();
+  await writeLog({action:"MOVE_TABLE", message:`ย้าย ${bill.tableName} ไป ${toTable.name} (${segMin} นาที ${segAmt} บาท) โดย ${actor.name}`, billId:bill.id, actor});
+}
+
+async function closeBill({bill, actor}){
+  const now = Date.now();
+  const segMin = bill.billingMode==="hour" ? diffMin(ms(bill.startAt), now) : 0;
+  const minutes = (bill.minutes||0) + segMin;
+  const tableAmount = bill.billingMode==="game"
+    ? calcTable({zone:bill.zone, mode:"game", games:bill.games||0})
+    : (bill.tableAmount||0) + calcTable({zone:bill.zone, mode:"hour", minutes:segMin});
+  const total = Math.max(0, tableAmount + (bill.itemsAmount||0) - (bill.discount||0));
+  const b = writeBatch(db);
+  b.update(doc(db,"bills",bill.id), { status:"awaiting_payment", endAt:serverTimestamp(), minutes, tableAmount, total, closedBy:actor, updatedAt:serverTimestamp() });
+  if(bill.tableId) b.update(doc(db,"tables",bill.tableId), { status:"unpaid" });
+  await b.commit();
+  await writeLog({action:"CLOSE_BILL", message:`ปิดไฟ ${bill.tableName} รวม ${minutes} นาที ยอด ${total} บาท โดย ${actor.name}`, billId:bill.id, tableId:bill.tableId, actor});
+}
+
+async function payBill({bill, method, note, actor}){
+  const b = writeBatch(db);
+  b.update(doc(db,"bills",bill.id), {
+    status: method==="debt" ? "debt" : "paid",
+    paymentMethod:method, note:note||"", paidBy:actor, paidAt:serverTimestamp(), updatedAt:serverTimestamp()
+  });
+  if(bill.tableId) b.update(doc(db,"tables",bill.tableId), { status:"free", currentBillId:null });
+  await b.commit();
+  const label = {cash:"เงินสด", transfer:"โอนเงิน", debt:"ค้างชำระ"}[method];
+  await writeLog({action:"PAY_BILL", message:`ชำระบิล ${bill.billNo} (${label}) ${bill.total} บาท โดย ${actor.name}`, billId:bill.id, tableId:bill.tableId, actor});
+}
+
+async function quickSale({customerName, actor}){
+  const ref = await addDoc(collection(db,"bills"), {
+    billNo:"Q"+Date.now().toString().slice(-7), type:"quick",
+    tableId:null, tableName:"ขายหน้าร้าน", zone:null, billingMode:null,
+    customerName:customerName||"", customerKey:(customerName||"").trim().toLowerCase(),
+    status:"awaiting_payment", startAt:serverTimestamp(), endAt:serverTimestamp(),
+    minutes:0, games:0, tableAmount:0, itemsAmount:0, discount:0, total:0,
+    paymentMethod:null, note:"", mergedFrom:[], moveHistory:[],
+    createdBy:actor, createdAt:serverTimestamp(), updatedAt:serverTimestamp(), ...keysOf()
+  });
+  await writeLog({action:"OPEN_TABLE", message:`เปิดบิลขายน้ำ (${customerName||"ไม่ระบุชื่อ"}) โดย ${actor.name}`, billId:ref.id, actor});
+  return ref.id;
+}
+
+/* ================= hook: ฟังข้อมูล real-time ================= */
+function useLive(q, deps=[]){
+  const [data,setData] = useState([]);
+  useEffect(() => {
+    if(!q) return;
+    const un = onSnapshot(q, s => setData(s.docs.map(d=>({id:d.id, ...d.data()}))));
+    return () => un();
+  }, deps);
+  return data;
+}
+
+/* ================= UI ย่อย ================= */
+function Timer({startAt, extra=0, cls}){
+  const [now,setNow] = useState(Date.now());
+  useEffect(()=>{ const i=setInterval(()=>setNow(Date.now()),1000); return ()=>clearInterval(i); },[]);
+  const s = ms(startAt) ? (now-ms(startAt))/1000 + extra*60 : 0;
+  return <div className={"tabular font-bold tracking-wider "+cls}>{hhmmss(s)}</div>;
+}
+
+function Sheet({title, onClose, children}){
+  return (
+    <div className="fixed inset-0 z-50 flex items-end bg-black/70 sm:items-center sm:justify-center" onClick={onClose}>
+      <div onClick={e=>e.stopPropagation()} className="max-h-[88vh] w-full overflow-y-auto rounded-t-3xl bg-slate-800 p-5 pb-10 sm:max-w-md sm:rounded-3xl">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-lg font-bold">{title}</h3>
+          <button onClick={onClose} className="h-9 w-9 rounded-full bg-slate-700 text-xl">×</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function Btn({children, cls="bg-slate-700", ...p}){
+  return <button {...p} className={`h-12 rounded-xl px-4 font-semibold text-white active:scale-95 ${cls}`}>{children}</button>;
+}
+
+/* ================= การ์ดโต๊ะ ================= */
+const STATE = {
+  free:     {ring:"ring-emerald-500", bg:"bg-emerald-500/10", dot:"bg-emerald-400", text:"ว่าง"},
+  occupied: {ring:"ring-red-500",     bg:"bg-red-500/10",     dot:"bg-red-400",     text:"กำลังใช้งาน"},
+  unpaid:   {ring:"ring-amber-400",   bg:"bg-amber-400/10",   dot:"bg-amber-300",   text:"รอชำระเงิน"}
+};
+
+function TableCard({table, bill, onOpen, onDetail, onMove, onClose}){
+  const s = STATE[table.status] || STATE.free;
+  const z = ZONES[table.zone];
+  const live = bill && bill.billingMode==="hour" && bill.startAt
+    ? (bill.tableAmount||0) + calcTable({zone:bill.zone, mode:"hour", minutes:diffMin(ms(bill.startAt), Date.now())})
+    : (bill?.tableAmount || 0);
+  return (
+    <div className={`rounded-2xl p-4 ring-2 shadow-lg ${s.ring} ${s.bg}`}>
+      <div className="flex items-start justify-between">
+        <div>
+          <div className="text-xl font-bold">{table.name}</div>
+          <div className="text-xs text-slate-400">{z.hourRate} ฿/ชม. · {z.gameRate} ฿/เกม</div>
+        </div>
+        <div className="flex items-center gap-2">
+          <span className={`h-3 w-3 animate-pulse rounded-full ${s.dot}`}></span>
+          <span className="text-sm">{s.text}</span>
+        </div>
+      </div>
+
+      {table.status!=="free" && bill ? (
+        <div className="mt-3 rounded-xl bg-slate-900/70 p-3 text-center">
+          {bill.billingMode==="hour"
+            ? <Timer startAt={bill.startAt} extra={bill.minutes||0} cls="text-4xl sm:text-5xl" />
+            : <div className="text-4xl font-bold sm:text-5xl">{bill.games||0} <span className="text-lg">เกม</span></div>}
+          <div className="mt-2 flex justify-between text-xs text-slate-400">
+            <span>เปิดไฟ {clock(ms(bill.startAt))}</span>
+            <span>{bill.customerName || "ไม่ระบุชื่อ"}</span>
+          </div>
+          <div className="mt-1 flex justify-between text-sm">
+            <span>ค่าโต๊ะ {baht(live)}</span>
+            <span>ค่าน้ำ {baht(bill.itemsAmount)}</span>
+          </div>
+        </div>
+      ) : (
+        <div className="mt-3 rounded-xl bg-slate-900/40 p-6 text-center text-4xl font-bold text-emerald-400 sm:text-5xl">00:00:00</div>
+      )}
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        {table.status==="free" &&
+          <Btn cls="bg-emerald-600 col-span-2 text-lg" onClick={()=>onOpen(table)}>เปิดโต๊ะ</Btn>}
+        {table.status==="occupied" && <>
+          <Btn onClick={()=>onDetail(bill)}>สั่งน้ำ/บิล</Btn>
+          <Btn cls="bg-indigo-600" onClick={()=>onMove(bill)}>ย้ายโต๊ะ</Btn>
+          <Btn cls="bg-red-600 col-span-2" onClick={()=>onClose(bill)}>ปิดไฟ / คิดเงิน</Btn>
+        </>}
+        {table.status==="unpaid" &&
+          <Btn cls="bg-amber-500 col-span-2 !text-slate-900" onClick={()=>onDetail(bill)}>ชำระเงิน {baht(bill?.total)}</Btn>}
+      </div>
+    </div>
+  );
+}
+
+/* ================= หน้า Dashboard ================= */
+function Dashboard({actor, profile, isAdmin, go}){
+  const tables = useLive(query(collection(db,"tables"), orderBy("number")), []);
+  const bills  = useLive(query(collection(db,"bills"), where("status","in",["open","awaiting_payment"])), []);
+  const [openT,setOpenT] = useState(null);
+  const [moveB,setMoveB] = useState(null);
+  const [mode,setMode] = useState("hour");
+  const [cname,setCname] = useState("");
+  const [err,setErr] = useState("");
+
+  const billOf = id => bills.find(b => b.tableId === id);
+  const sum = useMemo(()=>({
+    busy: tables.filter(t=>t.status==="occupied").length,
+    wait: tables.filter(t=>t.status==="unpaid").length,
+    money: bills.filter(b=>b.status==="awaiting_payment").reduce((s,b)=>s+(b.total||0),0)
+  }), [tables,bills]);
+
+  const doOpen = async () => {
+    try { const id = await openTable({table:openT, mode, customerName:cname, actor});
+      setOpenT(null); setCname(""); setMode("hour"); go("bill", id);
+    } catch(e){ setErr(e.message); }
+  };
+
+  return (
+    <div className="min-h-screen pb-28">
+      <header className="sticky top-0 z-30 border-b border-slate-700 bg-slate-900/95 px-4 py-3 backdrop-blur">
+        <div className="flex items-center justify-between">
+          <div>
+            <h1 className="text-lg font-bold">สถานะโต๊ะ</h1>
+            <p className="text-xs text-slate-400">{profile.displayName} · {actor.device}</p>
+          </div>
+          <div className="flex gap-1.5 text-xs">
+            <button onClick={()=>go("reports")} className="rounded-lg bg-slate-700 px-3 py-2">รายงาน</button>
+            <button onClick={()=>go("debts")} className="rounded-lg bg-slate-700 px-3 py-2">ค้างจ่าย</button>
+            {isAdmin && <button onClick={()=>go("admin")} className="rounded-lg bg-slate-700 px-3 py-2">ผู้ใช้</button>}
+            <button onClick={()=>signOut(auth)} className="rounded-lg bg-red-600 px-3 py-2">ออก</button>
+          </div>
+        </div>
+        <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+          <div className="rounded-lg bg-red-500/15 py-2"><div className="text-xl font-bold text-red-300">{sum.busy}</div><div className="text-[11px] text-slate-400">กำลังใช้งาน</div></div>
+          <div className="rounded-lg bg-amber-400/15 py-2"><div className="text-xl font-bold text-amber-300">{sum.wait}</div><div className="text-[11px] text-slate-400">รอชำระ</div></div>
+          <div className="rounded-lg bg-emerald-500/15 py-2"><div className="text-lg font-bold text-emerald-300">{baht(sum.money)}</div><div className="text-[11px] text-slate-400">ยอดค้างในระบบ</div></div>
+        </div>
+      </header>
+
+      {Object.entries(ZONES).map(([k,z]) => (
+        <section key={k} className="px-4 pt-5">
+          <div className="mb-2 flex items-center gap-2">
+            <span className={`h-5 w-1.5 rounded ${z.color}`}></span>
+            <h2 className="font-bold">{z.label}</h2>
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            {tables.filter(t=>t.zone===k).map(t =>
+              <TableCard key={t.id} table={t} bill={billOf(t.id)}
+                onOpen={setOpenT}
+                onDetail={b=>go("bill", b.id)}
+                onMove={setMoveB}
+                onClose={async b => { if(confirm(`ยืนยันปิดไฟ ${b.tableName} ?`)){ await closeBill({bill:b, actor}); go("bill", b.id); } }} />
+            )}
+          </div>
+        </section>
+      ))}
+
+      <button onClick={async()=>{ const n=prompt("ชื่อลูกค้า (เว้นว่างได้)")??""; const id=await quickSale({customerName:n, actor}); go("bill", id); }}
+        className="fixed bottom-5 right-5 z-40 rounded-full bg-sky-600 px-5 py-4 text-sm font-bold shadow-2xl active:scale-95">
+        + ขายเครื่องดื่ม
+      </button>
+
+      {openT && <Sheet title={`เปิดโต๊ะ ${openT.name}`} onClose={()=>setOpenT(null)}>
+        <p className="mb-1 text-sm text-slate-300">รูปแบบคิดเงิน</p>
+        <div className="mb-4 grid grid-cols-2 gap-2">
+          {[["hour",`รายชั่วโมง ${ZONES[openT.zone].hourRate} ฿/ชม.`],["game",`รายเกม ${ZONES[openT.zone].gameRate} ฿/เกม`]].map(([v,t])=>
+            <button key={v} onClick={()=>setMode(v)} className={`h-16 rounded-xl text-sm font-semibold ${mode===v?"bg-emerald-600":"bg-slate-700"}`}>{t}</button>)}
+        </div>
+        <p className="mb-1 text-sm text-slate-300">ชื่อลูกค้า (ไม่ใส่ก็ได้)</p>
+        <input value={cname} onChange={e=>setCname(e.target.value)} placeholder="เช่น พี่โต้ง"
+          className="mb-4 w-full rounded-xl bg-slate-700 px-4 py-3 outline-none" />
+        {err && <p className="mb-2 text-sm text-red-400">{err}</p>}
+        <Btn cls="bg-emerald-600 w-full text-lg" onClick={doOpen}>เปิดไฟและเริ่มจับเวลา</Btn>
+      </Sheet>}
+
+      {moveB && <Sheet title={`ย้ายจาก ${moveB.tableName}`} onClose={()=>setMoveB(null)}>
+        <p className="mb-3 text-xs text-slate-400">ระบบจะตัดยอดเวลาที่เล่นไปแล้วเก็บไว้ แล้วเริ่มนับใหม่ที่โต๊ะปลายทาง</p>
+        <div className="grid grid-cols-2 gap-2">
+          {tables.filter(t=>t.status==="free").map(t =>
+            <button key={t.id} onClick={async()=>{ await moveTable({bill:moveB, toTable:t, actor}); setMoveB(null); }}
+              className="h-16 rounded-xl bg-slate-700 font-semibold active:scale-95">
+              {t.name}<div className="text-[11px] text-slate-400">{ZONES[t.zone].label}</div>
+            </button>)}
+          {tables.filter(t=>t.status==="free").length===0 && <p className="col-span-2 py-6 text-center text-slate-400">ไม่มีโต๊ะว่าง</p>}
+        </div>
+      </Sheet>}
+    </div>
+  );
+}
+
+/* ================= หน้ารายละเอียดบิล ================= */
+function BillPage({billId, actor, go}){
+  const [bill,setBill] = useState(null);
+  const items = useLive(query(collection(db,"bills",billId,"items"), orderBy("createdAt")), [billId]);
+  const products = useLive(query(collection(db,"products"), orderBy("order")), []);
+  const [pay,setPay] = useState(false);
+  const [note,setNote] = useState("");
+
+  useEffect(()=>onSnapshot(doc(db,"bills",billId), s=>setBill(s.exists()?{id:s.id,...s.data()}:null)),[billId]);
+  if(!bill) return <div className="p-10 text-center">กำลังโหลด...</div>;
+
+  const liveTable = bill.status==="open" && bill.billingMode==="hour"
+    ? (bill.tableAmount||0) + calcTable({zone:bill.zone, mode:"hour", minutes:diffMin(ms(bill.startAt),Date.now())})
+    : bill.tableAmount||0;
+  const liveTotal = liveTable + (bill.itemsAmount||0) - (bill.discount||0);
+
+  return (
+    <div className="min-h-screen pb-10">
+      <header className="sticky top-0 z-30 flex items-center gap-3 border-b border-slate-700 bg-slate-900/95 px-4 py-3 backdrop-blur">
+        <button onClick={()=>go("dash")} className="rounded-lg bg-slate-700 px-3 py-2 text-sm">กลับ</button>
+        <div>
+          <div className="font-bold">{bill.tableName} · {bill.billNo}</div>
+          <div className="text-xs text-slate-400">{bill.customerName||"ไม่ระบุชื่อลูกค้า"}</div>
+        </div>
+      </header>
+
+      <div className="space-y-4 p-4">
+        <div className="rounded-2xl bg-slate-800 p-4">
+          {bill.status==="open" && bill.billingMode==="hour" && <Timer startAt={bill.startAt} extra={bill.minutes||0} cls="text-center text-5xl" />}
+          {bill.billingMode==="game" &&
+            <div className="flex items-center justify-center gap-4">
+              <Btn cls="bg-slate-700" onClick={()=>setGames({bill, games:(bill.games||0)-1, actor})}>−</Btn>
+              <div className="text-4xl font-bold">{bill.games||0} เกม</div>
+              <Btn cls="bg-emerald-600" onClick={()=>setGames({bill, games:(bill.games||0)+1, actor})}>+</Btn>
+            </div>}
+          <div className="mt-3 space-y-1 text-sm text-slate-300">
+            <div className="flex justify-between"><span>เวลาเปิดไฟ</span><span>{clock(ms(bill.startAt))}</span></div>
+            <div className="flex justify-between"><span>เวลาปิดไฟ</span><span>{clock(ms(bill.endAt))}</span></div>
+            <div className="flex justify-between"><span>รวมเวลา</span><span>{bill.minutes||0} นาที</span></div>
+            <div className="flex justify-between"><span>ค่าโต๊ะ</span><span>{baht(liveTable)}</span></div>
+            <div className="flex justify-between"><span>ค่าเครื่องดื่ม</span><span>{baht(bill.itemsAmount)}</span></div>
+            <div className="mt-2 flex justify-between border-t border-slate-600 pt-2 text-xl font-bold text-emerald-400"><span>ยอดสุทธิ</span><span>{baht(liveTotal)}</span></div>
+          </div>
+        </div>
+
+        <div>
+          <p className="mb-2 font-bold">สั่งเครื่องดื่ม / สินค้า</p>
+          <div className="grid grid-cols-3 gap-2">
+            {products.map(p =>
+              <button key={p.id} onClick={()=>addItem({bill, product:p, qty:1, actor})}
+                className="rounded-xl bg-slate-700 p-3 text-center active:scale-95">
+                <div className="text-sm font-semibold">{p.name}</div>
+                <div className="text-xs text-slate-400">{p.price} ฿</div>
+              </button>)}
+          </div>
+        </div>
+
+        <div>
+          <p className="mb-2 font-bold">รายการในบิล</p>
+          {items.length===0 && <p className="text-sm text-slate-500">ยังไม่มีรายการ</p>}
+          {items.map(it =>
+            <div key={it.id} className="mb-1 flex items-center justify-between rounded-xl bg-slate-800 px-3 py-2">
+              <div><div className="text-sm">{it.name} x{it.qty}</div>
+                <div className="text-[11px] text-slate-500">โดย {it.addedBy?.name} · {it.addedBy?.device}</div></div>
+              <div className="flex items-center gap-2">
+                <span className="text-sm">{baht(it.amount)}</span>
+                <button onClick={()=>confirm("ลบรายการนี้?") && removeItem({bill, item:it, actor})}
+                  className="rounded-lg bg-red-600/80 px-2 py-1 text-xs">ลบ</button>
+              </div>
+            </div>)}
+        </div>
+
+        {bill.status==="open" &&
+          <Btn cls="bg-red-600 w-full text-lg" onClick={async()=>{ if(confirm("ปิดไฟและคิดเงิน?")) await closeBill({bill, actor}); }}>ปิดไฟ / คิดเงิน</Btn>}
+        {bill.status==="awaiting_payment" &&
+          <Btn cls="bg-amber-500 w-full text-lg !text-slate-900" onClick={()=>setPay(true)}>ชำระเงิน {baht(bill.total)}</Btn>}
+        {(bill.status==="paid"||bill.status==="debt") &&
+          <div className="rounded-xl bg-slate-800 p-4 text-center">
+            <div className="text-lg font-bold">{bill.status==="debt" ? "ค้างชำระ" : "ชำระแล้ว"}</div>
+            <div className="text-sm text-slate-400">{{cash:"เงินสด",transfer:"โอนเงิน",debt:"ค้างชำระ"}[bill.paymentMethod]} · {baht(bill.total)}</div>
+            {bill.note && <div className="mt-1 text-sm text-amber-300">หมายเหตุ: {bill.note}</div>}
+          </div>}
+      </div>
+
+      {pay && <Sheet title={`ชำระเงิน ${baht(bill.total)}`} onClose={()=>setPay(false)}>
+        <p className="mb-1 text-sm text-slate-300">หมายเหตุ (กรณีค้างชำระ ให้ระบุชื่อลูกค้า)</p>
+        <input value={note} onChange={e=>setNote(e.target.value)} placeholder="เช่น พี่โต้ง มาจ่ายพรุ่งนี้"
+          className="mb-4 w-full rounded-xl bg-slate-700 px-4 py-3 outline-none" />
+        <div className="grid gap-2">
+          <Btn cls="bg-emerald-600 text-lg" onClick={async()=>{ await payBill({bill, method:"cash", note, actor}); go("dash"); }}>เงินสด</Btn>
+          <Btn cls="bg-sky-600 text-lg" onClick={async()=>{ await payBill({bill, method:"transfer", note, actor}); go("dash"); }}>โอนเงิน / PromptPay</Btn>
+          <Btn cls="bg-amber-500 text-lg !text-slate-900" onClick={async()=>{ await payBill({bill, method:"debt", note, actor}); go("dash"); }}>ค้างชำระ</Btn>
+        </div>
+      </Sheet>}
+    </div>
+  );
+}
+
+/* ================= หน้าลูกค้าค้างจ่าย ================= */
+function DebtsPage({actor, go}){
+  const debts = useLive(query(collection(db,"bills"), where("status","==","debt")), []);
+  const total = debts.reduce((s,b)=>s+(b.total||0),0);
+  return (
+    <div className="min-h-screen p-4">
+      <div className="mb-4 flex items-center gap-3">
+        <button onClick={()=>go("dash")} className="rounded-lg bg-slate-700 px-3 py-2 text-sm">กลับ</button>
+        <h1 className="text-lg font-bold">ลูกค้าค้างจ่าย</h1>
+      </div>
+      <div className="mb-4 rounded-2xl bg-amber-500/15 p-4 text-center">
+        <div className="text-3xl font-bold text-amber-300">{baht(total)}</div>
+        <div className="text-xs text-slate-400">ยอดค้างทั้งหมด {debts.length} บิล</div>
+      </div>
+      {debts.map(b =>
+        <div key={b.id} className="mb-2 rounded-xl bg-slate-800 p-3">
+          <div className="flex justify-between font-semibold">
+            <span>{b.customerName || "ไม่ระบุชื่อ"}</span><span className="text-amber-300">{baht(b.total)}</span>
+          </div>
+          <div className="text-xs text-slate-400">{b.tableName} · {b.dayKey} · {b.note}</div>
+          <Btn cls="bg-emerald-600 mt-2 w-full" onClick={async()=>{ if(confirm("ยืนยันว่าลูกค้าจ่ายแล้ว?")) await payBill({bill:b, method:"cash", note:b.note+" (เก็บแล้ว)", actor}); }}>
+            รับชำระแล้ว
+          </Btn>
+        </div>)}
+      {debts.length===0 && <p className="py-10 text-center text-slate-500">ไม่มีลูกค้าค้างจ่าย</p>}
+    </div>
+  );
+}
+
+/* ================= หน้ารายงาน ================= */
+function ReportsPage({go}){
+  const [mode,setMode] = useState("day");
+  const [key,setKey]   = useState(dayKey());
+  const field = {day:"dayKey", month:"monthKey", year:"yearKey"}[mode];
+  const rows = useLive(query(collection(db,"bills"), where(field,"==",key), where("status","in",["paid","debt"])), [field,key]);
+  const sum = rows.reduce((a,b)=>({
+    table:a.table+(b.tableAmount||0), items:a.items+(b.itemsAmount||0),
+    total:a.total+(b.total||0), debt:a.debt+(b.status==="debt"?b.total:0)
+  }), {table:0,items:0,total:0,debt:0});
+  const byCustomer = useMemo(()=>{
+    const m={}; rows.forEach(b=>{ const k=b.customerName||"ไม่ระบุชื่อ"; m[k]=(m[k]||0)+(b.total||0); });
+    return Object.entries(m).sort((a,b)=>b[1]-a[1]);
+  },[rows]);
+
+  return (
+    <div className="min-h-screen p-4">
+      <div className="mb-4 flex items-center gap-3">
+        <button onClick={()=>go("dash")} className="rounded-lg bg-slate-700 px-3 py-2 text-sm">กลับ</button>
+        <h1 className="text-lg font-bold">รายงานยอดขาย</h1>
+      </div>
+      <div className="mb-3 grid grid-cols-3 gap-2">
+        {[["day","รายวัน",dayKey()],["month","รายเดือน",dayKey().slice(0,7)],["year","รายปี",dayKey().slice(0,4)]].map(([m,t,k])=>
+          <button key={m} onClick={()=>{setMode(m); setKey(k);}} className={`h-11 rounded-xl text-sm font-semibold ${mode===m?"bg-emerald-600":"bg-slate-700"}`}>{t}</button>)}
+      </div>
+      <input value={key} onChange={e=>setKey(e.target.value)} className="mb-4 w-full rounded-xl bg-slate-700 px-4 py-3 text-center outline-none" />
+      <div className="mb-4 grid grid-cols-2 gap-2 text-center">
+        <div className="rounded-xl bg-slate-800 p-3"><div className="text-xl font-bold">{baht(sum.table)}</div><div className="text-xs text-slate-400">ค่าโต๊ะ</div></div>
+        <div className="rounded-xl bg-slate-800 p-3"><div className="text-xl font-bold">{baht(sum.items)}</div><div className="text-xs text-slate-400">ค่าเครื่องดื่ม</div></div>
+        <div className="rounded-xl bg-emerald-600/20 p-3"><div className="text-xl font-bold text-emerald-300">{baht(sum.total)}</div><div className="text-xs text-slate-400">ยอดรวม ({rows.length} บิล)</div></div>
+        <div className="rounded-xl bg-amber-500/20 p-3"><div className="text-xl font-bold text-amber-300">{baht(sum.debt)}</div><div className="text-xs text-slate-400">ค้างชำระ</div></div>
+      </div>
+      <p className="mb-2 font-bold">แยกตามลูกค้า</p>
+      {byCustomer.map(([n,v]) =>
+        <div key={n} className="mb-1 flex justify-between rounded-xl bg-slate-800 px-3 py-2 text-sm"><span>{n}</span><span>{baht(v)}</span></div>)}
+      <p className="mb-2 mt-4 font-bold">รายละเอียดบิล</p>
+      {rows.map(b =>
+        <div key={b.id} className="mb-1 rounded-xl bg-slate-800 p-3 text-sm">
+          <div className="flex justify-between font-semibold"><span>{b.billNo} · {b.tableName}</span><span>{baht(b.total)}</span></div>
+          <div className="text-xs text-slate-400">
+            {clock(ms(b.startAt))}-{clock(ms(b.endAt))} · {b.minutes||0} นาที · โต๊ะ {b.tableAmount} ฿ · น้ำ {b.itemsAmount} ฿ · {{cash:"เงินสด",transfer:"โอน",debt:"ค้าง"}[b.paymentMethod]}
+          </div>
+          <div className="text-[11px] text-slate-500">เปิดโดย {b.createdBy?.name} ({b.createdBy?.device})</div>
+        </div>)}
+    </div>
+  );
+}
+
+/* ================= หน้าแอดมิน: อนุมัติพนักงาน ================= */
+function AdminPage({actor, go}){
+  const users = useLive(query(collection(db,"users")), []);
+  const logs  = useLive(query(collection(db,"logs"), orderBy("createdAt","desc"), limit(50)), []);
+  return (
+    <div className="min-h-screen p-4">
+      <div className="mb-4 flex items-center gap-3">
+        <button onClick={()=>go("dash")} className="rounded-lg bg-slate-700 px-3 py-2 text-sm">กลับ</button>
+        <h1 className="text-lg font-bold">ผู้ใช้งาน และ ประวัติการใช้งาน</h1>
+      </div>
+      {users.map(u =>
+        <div key={u.id} className="mb-2 flex items-center justify-between rounded-xl bg-slate-800 p-3">
+          <div><div className="font-semibold">{u.displayName || u.email}</div>
+            <div className="text-xs text-slate-400">{u.email} · {u.role} · {u.status}</div></div>
+          {u.status!=="approved"
+            ? <Btn cls="bg-emerald-600 !h-10 text-sm" onClick={()=>updateDoc(doc(db,"users",u.id),{status:"approved", approvedBy:actor.uid, approvedAt:serverTimestamp()})}>อนุมัติ</Btn>
+            : u.role!=="admin" && <Btn cls="bg-red-600 !h-10 text-sm" onClick={()=>updateDoc(doc(db,"users",u.id),{status:"rejected"})}>ระงับ</Btn>}
+        </div>)}
+      <p className="mb-2 mt-5 font-bold">Audit Log ล่าสุด</p>
+      {logs.map(l =>
+        <div key={l.id} className="mb-1 rounded-lg bg-slate-800 px-3 py-2 text-xs">
+          <div>{l.message}</div>
+          <div className="text-slate-500">{l.deviceName} · {l.createdAt?.toDate?.().toLocaleString("th-TH") || "-"}</div>
+        </div>)}
+    </div>
+  );
+}
+
+/* ================= หน้าล็อกอิน ================= */
+function Login(){
+  const [email,setEmail] = useState(""); const [pw,setPw] = useState("");
+  const [isNew,setIsNew] = useState(false); const [err,setErr] = useState("");
+  const submit = async () => {
+    setErr("");
+    try { isNew ? await createUserWithEmailAndPassword(auth,email,pw)
+                : await signInWithEmailAndPassword(auth,email,pw); }
+    catch(e){ setErr(e.code); }
+  };
+  return (
+    <div className="flex min-h-screen items-center justify-center p-6">
+      <div className="w-full max-w-sm rounded-3xl bg-slate-800 p-6">
+        <h1 className="mb-1 text-2xl font-bold">ระบบร้านสนุ๊กเกอร์</h1>
+        <p className="mb-5 text-sm text-slate-400">{isNew ? "สมัครใหม่ ต้องรอแอดมินอนุมัติ" : "เข้าสู่ระบบ"}</p>
+        <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="อีเมล" type="email"
+          className="mb-3 w-full rounded-xl bg-slate-700 px-4 py-3 outline-none" />
+        <input value={pw} onChange={e=>setPw(e.target.value)} placeholder="รหัสผ่าน" type="password"
+          className="mb-4 w-full rounded-xl bg-slate-700 px-4 py-3 outline-none" />
+        {err && <p className="mb-3 text-sm text-red-400">{err}</p>}
+        <Btn cls="bg-emerald-600 w-full text-lg" onClick={submit}>{isNew ? "สมัครสมาชิก" : "เข้าสู่ระบบ"}</Btn>
+        <button onClick={()=>setIsNew(!isNew)} className="mt-4 w-full text-sm text-slate-400">
+          {isNew ? "มีบัญชีแล้ว? เข้าสู่ระบบ" : "ยังไม่มีบัญชี? สมัครใหม่"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ================= แอปหลัก + Toast + ติดตั้งข้อมูลตั้งต้น ================= */
+function App(){
+  const [user,setUser] = useState(null);
+  const [profile,setProfile] = useState(null);
+  const [loading,setLoading] = useState(true);
+  const [page,setPage] = useState({name:"dash", id:null});
+  const [toasts,setToasts] = useState([]);
+  const device = useMemo(getDevice, []);
+  const go = (name,id=null) => setPage({name,id});
+
+  useEffect(()=>onAuthStateChanged(auth, async u=>{
+    setUser(u);
+    if(u){
+      const ref = doc(db,"users",u.uid);
+      const s = await getDoc(ref);
+      if(!s.exists()) await setDoc(ref,{ email:u.email, displayName:u.email.split("@")[0],
+        role:"staff", status:"pending", createdAt:serverTimestamp() });
+    } else setProfile(null);
+    setLoading(false);
+  }),[]);
+
+  useEffect(()=>{ if(!user) return;
+    return onSnapshot(doc(db,"users",user.uid), s=>setProfile(s.exists()?{id:s.id,...s.data()}:null));
+  },[user]);
+
+  const approved = profile?.status === "approved";
+
+  /* Toast แจ้งเตือนทุกเครื่องแบบ real-time */
+  useEffect(()=>{ if(!approved) return;
+    let first = true;
+    return onSnapshot(query(collection(db,"logs"), orderBy("createdAt","desc"), limit(1)), snap=>{
+      if(first){ first=false; return; }
+      snap.docChanges().forEach(c=>{
+        if(c.type!=="added") return;
+        const d = c.doc.data(); const id = Math.random();
+        setToasts(t=>[...t,{id, msg:`${d.message} [${d.deviceName}]`}]);
+        setTimeout(()=>setToasts(t=>t.filter(x=>x.id!==id)), 4000);
+      });
+    });
+  },[approved]);
+
+  if(loading) return <div className="p-10 text-center">กำลังโหลด...</div>;
+  if(!user) return <Login />;
+  if(!profile) return <div className="p-10 text-center">กำลังเตรียมบัญชี...</div>;
+
+  if(!approved) return (
+    <div className="flex min-h-screen items-center justify-center p-6 text-center">
+      <div>
+        <div className="mb-3 text-5xl">⏳</div>
+        <h1 className="mb-2 text-xl font-bold">รอแอดมินอนุมัติ</h1>
+        <p className="mb-5 text-sm text-slate-400">{profile.email}<br/>เมื่อแอดมินกดอนุมัติ หน้านี้จะเข้าระบบให้อัตโนมัติ</p>
+        <Btn cls="bg-red-600" onClick={()=>signOut(auth)}>ออกจากระบบ</Btn>
+      </div>
+    </div>
+  );
+
+  const actor = { uid:user.uid, name:profile.displayName||user.email, email:user.email, device };
+  const isAdmin = profile.role === "admin";
+
+  return (<>
+    {page.name==="dash"    && <Dashboard actor={actor} profile={profile} isAdmin={isAdmin} go={go} />}
+    {page.name==="bill"    && <BillPage billId={page.id} actor={actor} go={go} />}
+    {page.name==="debts"   && <DebtsPage actor={actor} go={go} />}
+    {page.name==="reports" && <ReportsPage go={go} />}
+    {page.name==="admin"   && isAdmin && <AdminPage actor={actor} go={go} />}
+
+    <div className="fixed left-1/2 top-3 z-[9999] w-[92%] max-w-md -translate-x-1/2 space-y-2">
+      {toasts.map(t =>
+        <div key={t.id} className="rounded-xl border border-slate-600 bg-slate-800/95 px-4 py-3 text-sm shadow-2xl backdrop-blur">{t.msg}</div>)}
+    </div>
+
+    {isAdmin &&
+      <button onClick={async()=>{
+        if(!confirm("สร้างโต๊ะ 6 ตัว และรายการสินค้าทั้งหมด? (กดครั้งเดียวพอ)")) return;
+        for(const t of SEED_TABLES) await setDoc(doc(db,"tables","t"+t.number), {...t, status:"free", currentBillId:null});
+        for(const p of SEED_PRODUCTS) await setDoc(doc(db,"products",p.id), {...p, active:true});
+        alert("ติดตั้งข้อมูลตั้งต้นเรียบร้อย");
+      }} className="fixed bottom-5 left-5 z-40 rounded-full bg-slate-700/80 px-3 py-2 text-[11px]">
+        ติดตั้งข้อมูลตั้งต้น
+      </button>}
+  </>);
+}
+
+createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
